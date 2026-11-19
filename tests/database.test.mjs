@@ -1,0 +1,17 @@
+import {test} from 'node:test';import assert from 'node:assert/strict';import fs from 'node:fs/promises';import {PGlite} from '@electric-sql/pglite';
+const admin='11111111-1111-4111-8111-111111111111',worker='22222222-2222-4222-8222-222222222222',viewer='33333333-3333-4333-8333-333333333333',batch='aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',session='bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',code=`IP1:${batch}:1`;
+test('database: peran, data sensus, idempotensi dan panen tidak ganda',async()=>{
+ const db=new PGlite();try{
+  await db.exec(`create role anon;create role authenticated;create schema auth;create function auth.uid() returns uuid language sql stable as $$ select nullif(current_setting('request.jwt.claim.sub',true),'')::uuid $$;create table public.marking_members(user_id uuid primary key,display_name text,role text,job text,active boolean,harvest_access boolean,report_access boolean);create table public.marking_boundaries(id text primary key,geojson jsonb);insert into public.marking_boundaries values('active','{"features":[{"properties":{"nama_blok":"D11"}}]}');insert into public.marking_members values('${admin}','Admin','admin','sensus',true,true,true),('${worker}','GIS','petugas','sensus',true,false,false),('${viewer}','Lihat','petugas','panen',true,false,true);`);
+  await db.exec(await fs.readFile('supabase/migration.sql','utf8'));
+  const actor=async id=>db.query("select set_config('request.jwt.claim.sub',$1,false)",[id]);
+  const rpc=async(name,...args)=>(await db.query(`select public.${name}(${args.map((_,i)=>'$'+(i+1)).join(',')}) as result`,args)).rows[0].result;
+  await actor(admin);await rpc('ip_make_batch',batch,200000);await actor(viewer);await assert.rejects(()=>rpc('ip_make_batch','cccccccc-cccc-4ccc-8ccc-cccccccccccc',10));
+  await actor(worker);const reg={id:'10000000-0000-4000-8000-000000000001',code,type:'register',block:'D11',row:'5',phase:'PC',lat:-7.1,lng:109.1};const first=await rpc('ip_apply_event',reg);assert.equal(first.version,1);assert.equal(first.condition,'belum_sensus');assert.deepEqual(await rpc('ip_apply_event',reg),first);
+  await rpc('ip_start_session',session,'D11');const census={id:'10000000-0000-4000-8000-000000000002',code,type:'census',expectedVersion:1,sessionId:session,condition:'hidup',color:'BK'};await rpc('ip_apply_event',census);
+  assert.equal((await rpc('ip_get_tree',code)).tree.color,null);await rpc('ip_apply_session',session);let current=(await rpc('ip_get_tree',code)).tree;assert.equal(current.color,'BK');assert.equal(current.version,2);
+  const h={id:'10000000-0000-4000-8000-000000000003',code,type:'harvest',expectedVersion:2,phase:'PC',color:'BK',date:'2026-11-19'};await assert.rejects(()=>rpc('ip_apply_event',h));await actor(admin);current=await rpc('ip_apply_event',h);assert.equal(current.phase,'R1');assert.deepEqual(await rpc('ip_apply_event',h),current);await assert.rejects(()=>rpc('ip_apply_event',{...h,id:'10000000-0000-4000-8000-000000000004'}));
+  await actor(viewer);assert.equal((await rpc('ip_get_tree',code)).tree.phase,'R1');await assert.rejects(()=>rpc('ip_apply_event',{...h,id:'10000000-0000-4000-8000-000000000005'}));
+  assert.equal((await rpc('ip_list_sessions'))[0].total,1);assert.equal((await rpc('ip_session_export',session,'',1000))[0].condition,'hidup');await actor(worker);await assert.rejects(()=>rpc('ip_session_export',session,'',1000));
+ }finally{await db.close();}
+});
